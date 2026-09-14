@@ -1,6 +1,7 @@
 import { EventConfig, Guest, GuestbookEntry, SupabaseConfig } from '../types';
 import { getStoredSupabaseConfig, saveStoredSupabaseConfig, saveSupabaseCredentials } from '../lib/supabase';
 import { saveImageKitCredentials } from '../lib/imagekitClient';
+import { saveR2Credentials } from './r2Client';
 import { saveSupabaseConfigToCloud } from '../lib/firebase';
 
 export interface ParsedBackup {
@@ -13,6 +14,7 @@ export interface ParsedBackup {
   hasGuestbook: boolean;
   hasSupabase: boolean;
   hasImageKit: boolean;
+  hasR2?: boolean;
   hasFirebase?: boolean;
   eventConfig?: EventConfig;
   guests?: Guest[];
@@ -29,6 +31,13 @@ export interface ParsedBackup {
     privateKey?: string;
     urlEndpoint: string;
   };
+  r2?: {
+    accountId: string;
+    accessKeyId: string;
+    secretAccessKey?: string;
+    bucketName: string;
+    publicUrl?: string;
+  };
   firebase?: {
     projectId?: string;
     firestoreDatabaseId?: string;
@@ -42,6 +51,7 @@ export interface ParsedBackup {
     supabaseUrl?: string;
     supabaseMode?: string;
     imagekitUrl?: string;
+    r2Bucket?: string;
     firebaseProjectId?: string;
   };
   errors: string[];
@@ -476,7 +486,7 @@ export function parseBackupData(rawContent: string | object): ParsedBackup {
   const cleanIkPrivate = typeof rawIkPrivate === 'string' && !isMaskedValue(rawIkPrivate) ? rawIkPrivate.trim() : '';
   const cleanIkEndpoint = typeof rawIkEndpoint === 'string' && !isMaskedValue(rawIkEndpoint) ? rawIkEndpoint.trim() : '';
 
-  if (cleanIkPublic || cleanIkEndpoint || cleanIkPrivate) {
+    if (cleanIkPublic || cleanIkEndpoint || cleanIkPrivate) {
     imagekit = {
       publicKey: cleanIkPublic,
       privateKey: cleanIkPrivate || undefined,
@@ -484,7 +494,40 @@ export function parseBackupData(rawContent: string | object): ParsedBackup {
     };
   }
 
-  // 6. Extract Firebase Provisioned Settings
+  // 6. Extract Cloudflare R2 Settings
+  const r2Container =
+    root.cloudSettings?.r2 ||
+    root.cloudAccountSettings?.r2 ||
+    root.INITIAL_CLOUD_SETTINGS?.r2 ||
+    root.r2 ||
+    root.r2Config ||
+    root;
+
+  let r2: ParsedBackup['r2'] | undefined;
+
+  const rawR2Account = r2Container?.accountId || r2Container?.account_id || root.r2AccountId;
+  const rawR2AccessKey = r2Container?.accessKeyId || r2Container?.access_key_id || root.r2AccessKeyId;
+  const rawR2Secret = r2Container?.secretAccessKey || r2Container?.secret_access_key || root.r2SecretAccessKey;
+  const rawR2Bucket = r2Container?.bucketName || r2Container?.bucket_name || r2Container?.bucket || root.r2BucketName;
+  const rawR2PublicUrl = r2Container?.publicUrl || r2Container?.public_url || root.r2PublicUrl;
+
+  const cleanR2Account = typeof rawR2Account === 'string' && !isMaskedValue(rawR2Account) ? rawR2Account.trim() : '';
+  const cleanR2AccessKey = typeof rawR2AccessKey === 'string' && !isMaskedValue(rawR2AccessKey) ? rawR2AccessKey.trim() : '';
+  const cleanR2Secret = typeof rawR2Secret === 'string' && !isMaskedValue(rawR2Secret) ? rawR2Secret.trim() : '';
+  const cleanR2Bucket = typeof rawR2Bucket === 'string' && !isMaskedValue(rawR2Bucket) ? rawR2Bucket.trim() : '';
+  const cleanR2PublicUrl = typeof rawR2PublicUrl === 'string' && !isMaskedValue(rawR2PublicUrl) ? rawR2PublicUrl.trim() : '';
+
+  if (cleanR2Account || cleanR2AccessKey || cleanR2Bucket) {
+    r2 = {
+      accountId: cleanR2Account,
+      accessKeyId: cleanR2AccessKey,
+      secretAccessKey: cleanR2Secret || undefined,
+      bucketName: cleanR2Bucket,
+      publicUrl: cleanR2PublicUrl || undefined,
+    };
+  }
+
+  // 7. Extract Firebase Provisioned Settings
   const fbContainer =
     root.cloudSettings?.firebase ||
     root.cloudAccountSettings?.firebase ||
@@ -502,15 +545,16 @@ export function parseBackupData(rawContent: string | object): ParsedBackup {
     };
   }
 
-  // Check overall validity: At least eventConfig OR guests OR guestbook OR supabase OR imagekit OR firebase must be present
+  // Check overall validity: At least eventConfig OR guests OR guestbook OR supabase OR imagekit OR r2 OR firebase must be present
   const hasEventConfig = Boolean(eventConfig && (eventConfig.title || eventConfig.date || eventConfig.name));
   const hasGuests = Array.isArray(guests) && guests.length > 0;
   const hasGuestbook = Array.isArray(guestbookEntries) && guestbookEntries.length > 0;
   const hasSupabase = Boolean(supabase && (supabase.supabaseUrl || supabase.supabaseAnonKey || supabase.mode));
   const hasImageKit = Boolean(imagekit && (imagekit.publicKey || imagekit.urlEndpoint));
+  const hasR2 = Boolean(r2 && (r2.accountId || r2.bucketName));
   const hasFirebase = Boolean(firebase && (firebase.projectId || firebase.firestoreDatabaseId));
 
-  const isValid = hasEventConfig || hasGuests || hasGuestbook || hasSupabase || hasImageKit || hasFirebase;
+  const isValid = hasEventConfig || hasGuests || hasGuestbook || hasSupabase || hasImageKit || hasR2 || hasFirebase;
   if (!isValid) {
     errors.push('No recognized wedding data, guest list, or cloud credentials found in the provided backup file.');
   }
@@ -525,12 +569,14 @@ export function parseBackupData(rawContent: string | object): ParsedBackup {
     hasGuestbook,
     hasSupabase,
     hasImageKit,
+    hasR2,
     hasFirebase,
     eventConfig,
     guests,
     guestbookEntries,
     supabase,
     imagekit,
+    r2,
     firebase,
     summary: {
       title: eventConfig?.title,
@@ -539,6 +585,7 @@ export function parseBackupData(rawContent: string | object): ParsedBackup {
       supabaseUrl: supabase?.supabaseUrl,
       supabaseMode: supabase?.mode,
       imagekitUrl: imagekit?.urlEndpoint,
+      r2Bucket: r2?.bucketName,
       firebaseProjectId: firebase?.projectId
     },
     errors
@@ -559,6 +606,7 @@ export async function applyRestoreData(
     onSaveGuestbook?: (entries: GuestbookEntry[]) => Promise<void> | void;
     onUpdateSupabase?: (config: SupabaseConfig) => void;
     onUpdateImageKit?: (creds: { publicKey: string; privateKey?: string; urlEndpoint: string }) => void;
+    onUpdateR2?: (creds: { accountId: string; accessKeyId: string; secretAccessKey?: string; bucketName: string; publicUrl?: string }) => void;
   }
 ): Promise<{ success: boolean; message: string; details: string[] }> {
   if (!parsed.isValid) {
@@ -642,6 +690,25 @@ export async function applyRestoreData(
       details.push(`✓ ImageKit CDN credentials restored (${parsed.imagekit.urlEndpoint})`);
     } catch (err) {
       console.warn('Failed to save ImageKit credentials:', err);
+    }
+  }
+
+  // 6. Restore Cloudflare R2
+  if (parsed.r2) {
+    try {
+      await saveR2Credentials({
+        accountId: parsed.r2.accountId,
+        accessKeyId: parsed.r2.accessKeyId,
+        secretAccessKey: parsed.r2.secretAccessKey || '',
+        bucketName: parsed.r2.bucketName,
+        publicUrl: parsed.r2.publicUrl,
+      });
+      if (callbacks.onUpdateR2) {
+        callbacks.onUpdateR2(parsed.r2);
+      }
+      details.push(`✓ Cloudflare R2 video storage credentials restored (Bucket: ${parsed.r2.bucketName})`);
+    } catch (err) {
+      console.warn('Failed to save Cloudflare R2 credentials:', err);
     }
   }
 

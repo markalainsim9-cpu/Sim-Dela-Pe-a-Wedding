@@ -4,7 +4,8 @@ import {
   recordSupabaseReads,
   recordSupabaseWrites,
   recordSupabaseDeletes,
-  recordSupabasePing
+  recordSupabasePing,
+  extractSupabaseProjectRef
 } from './supabaseQuotaTracker';
 import { saveSupabaseConfigToCloud } from './firebase';
 
@@ -19,9 +20,18 @@ export const DEFAULT_SUPABASE_CONFIG: SupabaseConfig = {
   syncStatus: 'idle'
 };
 
-let cachedClient: SupabaseClient | null = null;
-let cachedClientUrl = '';
-let cachedClientKey = '';
+// Global singleton client cache across hot reloads, re-renders, and concurrent modules
+const GLOBAL_SUPABASE_CLIENTS_KEY = '__WEDDING_SUPABASE_CLIENT_MAP__';
+
+function getGlobalClientRegistry(): Map<string, SupabaseClient> {
+  const root = typeof globalThis !== 'undefined' 
+    ? (globalThis as any) 
+    : (typeof window !== 'undefined' ? (window as any) : ({} as any));
+  if (!root[GLOBAL_SUPABASE_CLIENTS_KEY]) {
+    root[GLOBAL_SUPABASE_CLIENTS_KEY] = new Map<string, SupabaseClient>();
+  }
+  return root[GLOBAL_SUPABASE_CLIENTS_KEY];
+}
 
 /**
  * Retrieves the stored Supabase configuration from localStorage.
@@ -48,12 +58,6 @@ export function getStoredSupabaseConfig(): SupabaseConfig {
 export function saveStoredSupabaseConfig(config: SupabaseConfig): void {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(config));
-    // Invalidate client cache if credentials changed
-    if (config.supabaseUrl !== cachedClientUrl || config.supabaseAnonKey !== cachedClientKey) {
-      cachedClient = null;
-      cachedClientUrl = '';
-      cachedClientKey = '';
-    }
   } catch (err) {
     console.warn('Failed to save Supabase config to localStorage:', err);
   }
@@ -102,7 +106,9 @@ export async function saveSupabaseCredentials(config: {
 }
 
 /**
- * Gets or initializes an active Supabase client instance.
+ * Gets or initializes an active Supabase client singleton instance.
+ * Reuses existing instances per (url, key) pair to prevent multiple GoTrueClient
+ * instances in the same browser context.
  */
 export function getSupabaseClient(overrideUrl?: string, overrideKey?: string): SupabaseClient | null {
   const url = (overrideUrl ?? getStoredSupabaseConfig().supabaseUrl).trim();
@@ -110,17 +116,32 @@ export function getSupabaseClient(overrideUrl?: string, overrideKey?: string): S
 
   if (!url || !key) return null;
 
-  if (cachedClient && cachedClientUrl === url && cachedClientKey === key) {
-    return cachedClient;
+  const registry = getGlobalClientRegistry();
+  const cacheKey = `${url}:::${key}`;
+
+  const existing = registry.get(cacheKey);
+  if (existing) {
+    return existing;
   }
 
   try {
+    const projectRef = extractSupabaseProjectRef(url) || 'wedding';
     const client = createClient(url, key, {
-      auth: { persistSession: false, autoRefreshToken: false }
+      auth: {
+        persistSession: false,
+        autoRefreshToken: false,
+        detectSessionInUrl: false,
+        storageKey: `sb_${projectRef}_wedding_singleton`,
+        storage: {
+          getItem: () => null,
+          setItem: () => {},
+          removeItem: () => {}
+        },
+        lock: async (_name, _acquireTimeout, fn) => await fn()
+      }
     });
-    cachedClient = client;
-    cachedClientUrl = url;
-    cachedClientKey = key;
+
+    registry.set(cacheKey, client);
     return client;
   } catch (err) {
     console.error('Error creating Supabase client:', err);
@@ -130,6 +151,7 @@ export function getSupabaseClient(overrideUrl?: string, overrideKey?: string): S
 
 /**
  * Tests the live connectivity to Supabase by checking the API endpoint.
+ * Reuses the singleton Supabase client rather than spawning duplicate GoTrue clients.
  */
 export async function testSupabaseConnection(
   customUrl?: string, 
@@ -162,9 +184,15 @@ export async function testSupabaseConnection(
   }
 
   try {
-    const client = createClient(url, key, {
-      auth: { persistSession: false, autoRefreshToken: false }
-    });
+    // Reuse the singleton client instance to avoid multiple GoTrueClient browser warnings
+    const client = getSupabaseClient(url, key);
+    if (!client) {
+      return {
+        success: false,
+        latencyMs: 0,
+        error: 'Failed to initialize Supabase client with the provided credentials.'
+      };
+    }
 
     // Check if tables are ready or queryable
     const detected: string[] = [];

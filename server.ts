@@ -24,7 +24,14 @@ import {
   uploadBufferToR2, 
   testR2Connection,
   deleteObjectFromR2,
-  extractR2ObjectKey
+  extractR2ObjectKey,
+  saveR2ConfigFile,
+  clearR2ConfigFile,
+  getStoredR2ConfigFile,
+  getR2Config,
+  maskSecretKey,
+  maskAccountId,
+  maskAccessKey
 } from './server/r2Service';
 
 // Initialize Firebase with Web SDK on Node.js using project web apiKey
@@ -245,6 +252,53 @@ async function initAuthoritativeState() {
     }, (err) => {
       console.warn('Server onSnapshot gbCol notice:', err.message);
     });
+
+    // 4. Synchronize Cloudflare R2 configuration from Firestore if r2-config.json is absent on disk
+    try {
+      if (!getStoredR2ConfigFile()) {
+        const r2Ref = doc(firestoreDb, 'event_config', 'r2_config');
+        const r2Snap = await getDoc(r2Ref);
+        if (r2Snap.exists()) {
+          const r2Data = r2Snap.data();
+          if (r2Data.accountId && r2Data.accessKeyId && r2Data.secretAccessKey && r2Data.bucketName) {
+            saveR2ConfigFile({
+              accountId: String(r2Data.accountId).trim(),
+              accessKeyId: String(r2Data.accessKeyId).trim(),
+              secretAccessKey: String(r2Data.secretAccessKey).trim(),
+              bucketName: String(r2Data.bucketName).trim(),
+              publicUrl: (r2Data.publicUrl || '').trim(),
+              updatedAt: r2Data.updatedAt || undefined,
+            });
+            console.log('✓ Server-Authoritative: Synchronized Cloudflare R2 credentials from Firestore to r2-config.json');
+          }
+        }
+      }
+    } catch (r2BootErr) {
+      console.warn('Notice: Could not load r2_config from Firestore on boot:', r2BootErr);
+    }
+
+    // 5. Synchronize ImageKit configuration from Firestore if imagekit-config.json is absent on disk
+    try {
+      if (!fs.existsSync(CONFIG_FILE)) {
+        const ikRef = doc(firestoreDb, 'event_config', 'imagekit_config');
+        const ikSnap = await getDoc(ikRef);
+        if (ikSnap.exists()) {
+          const ikData = ikSnap.data();
+          if (ikData.privateKey && String(ikData.privateKey).trim()) {
+            const ikPayload = {
+              publicKey: (ikData.publicKey || '').trim(),
+              privateKey: String(ikData.privateKey).trim(),
+              urlEndpoint: (ikData.urlEndpoint || '').trim(),
+              updatedAt: ikData.updatedAt || new Date().toISOString(),
+            };
+            fs.writeFileSync(CONFIG_FILE, JSON.stringify(ikPayload, null, 2), 'utf-8');
+            console.log('✓ Server-Authoritative: Synchronized ImageKit credentials from Firestore to imagekit-config.json');
+          }
+        }
+      }
+    } catch (ikBootErr) {
+      console.warn('Notice: Could not load imagekit_config from Firestore on boot:', ikBootErr);
+    }
   } catch (err) {
     console.error('Server-Authoritative initialization notice:', err);
   }
@@ -1071,10 +1125,17 @@ async function startServer() {
     }
   });
 
-  // 2. Test Cloudflare R2 connection
+  // 2. Test Cloudflare R2 connection (with provided or stored credentials)
   app.post('/api/r2/test', async (req: Request, res: Response) => {
     try {
-      const result = await testR2Connection();
+      const { accountId, accessKeyId, secretAccessKey, bucketName, publicUrl } = req.body || {};
+      const result = await testR2Connection({
+        accountId,
+        accessKeyId,
+        secretAccessKey,
+        bucketName,
+        publicUrl,
+      });
       if (result.success) {
         return res.json(result);
       } else {
@@ -1084,6 +1145,147 @@ async function startServer() {
       return res.status(500).json({
         success: false,
         message: err.message || 'Error occurred while testing Cloudflare R2 connection',
+      });
+    }
+  });
+
+  // 3. Save custom Cloudflare R2 credentials permanently
+  app.post('/api/r2/config', async (req: Request, res: Response) => {
+    try {
+      const { accountId, accessKeyId, secretAccessKey, bucketName, publicUrl, validateFirst, clear } = req.body;
+
+      // Detect if user intends to delete / clear all R2 credentials
+      const isClear = clear === true ||
+        (accountId !== undefined && accessKeyId !== undefined && secretAccessKey !== undefined && bucketName !== undefined &&
+         !String(accountId).trim() && !String(accessKeyId).trim() && !String(secretAccessKey).trim() && !String(bucketName).trim());
+
+      if (isClear) {
+        clearR2ConfigFile();
+        try {
+          await deleteDoc(doc(firestoreDb, 'event_config', 'r2_config'));
+        } catch {
+          // ignore
+        }
+        const fallbackStatus = getR2Status();
+        return res.json({
+          success: true,
+          cleared: true,
+          message: '✓ Cloudflare R2 credentials deleted from server and cloud.',
+          status: fallbackStatus,
+        });
+      }
+
+      const existingConfig = getR2Config();
+      const finalAccountId = (accountId && String(accountId).trim()) || existingConfig?.accountId || '';
+      const finalAccessKeyId = (accessKeyId && String(accessKeyId).trim()) || existingConfig?.accessKeyId || '';
+      const finalSecretAccessKey = (secretAccessKey && String(secretAccessKey).trim()) || existingConfig?.secretAccessKey || '';
+      const finalBucketName = (bucketName && String(bucketName).trim()) || existingConfig?.bucketName || '';
+      let finalPublicUrl = publicUrl !== undefined ? String(publicUrl).trim() : (existingConfig?.publicUrl || '');
+
+      if (!finalAccountId || !finalAccessKeyId || !finalSecretAccessKey || !finalBucketName) {
+        return res.status(400).json({
+          success: false,
+          error: 'Cloudflare Account ID, Access Key ID, Secret Access Key, and Bucket Name are all required, or clear all fields to remove credentials.',
+        });
+      }
+
+      if (validateFirst) {
+        const testRes = await testR2Connection({
+          accountId: finalAccountId,
+          accessKeyId: finalAccessKeyId,
+          secretAccessKey: finalSecretAccessKey,
+          bucketName: finalBucketName,
+          publicUrl: finalPublicUrl,
+        });
+        if (!testRes.success) {
+          return res.status(400).json({
+            success: false,
+            error: testRes.message || 'Validation failed for Cloudflare R2 credentials.',
+          });
+        }
+      }
+
+      saveR2ConfigFile({
+        accountId: finalAccountId,
+        accessKeyId: finalAccessKeyId,
+        secretAccessKey: finalSecretAccessKey,
+        bucketName: finalBucketName,
+        publicUrl: finalPublicUrl,
+      });
+
+      // Synchronize to Firestore event_config/r2_config so credentials persist across container restarts & machines
+      try {
+        await setDoc(doc(firestoreDb, 'event_config', 'r2_config'), {
+          accountId: finalAccountId,
+          accessKeyId: finalAccessKeyId,
+          secretAccessKey: finalSecretAccessKey,
+          bucketName: finalBucketName,
+          publicUrl: finalPublicUrl,
+          updatedAt: new Date().toISOString(),
+        }, { merge: true });
+      } catch (cloudErr) {
+        console.warn('Notice: Failed to sync r2_config to Firestore:', cloudErr);
+      }
+
+      const status = getR2Status();
+      return res.json({
+        success: true,
+        message: '✓ Cloudflare R2 credentials saved and activated successfully across Cloud & Server!',
+        status,
+      });
+    } catch (err: any) {
+      console.error('Failed to save Cloudflare R2 config:', err);
+      return res.status(500).json({
+        success: false,
+        error: err.message || 'Failed to save Cloudflare R2 configuration on the server.',
+      });
+    }
+  });
+
+  // 4. Explicitly delete Cloudflare R2 credentials from server and Cloud Firestore
+  app.post('/api/r2/clear', async (req: Request, res: Response) => {
+    try {
+      clearR2ConfigFile();
+      try {
+        await deleteDoc(doc(firestoreDb, 'event_config', 'r2_config'));
+      } catch {
+        // ignore
+      }
+      const fallbackStatus = getR2Status();
+      return res.json({
+        success: true,
+        cleared: true,
+        message: '✓ Cloudflare R2 credentials permanently deleted from Cloud and Server.',
+        status: fallbackStatus,
+      });
+    } catch (err: any) {
+      return res.status(500).json({
+        success: false,
+        error: err.message || 'Failed to clear Cloudflare R2 configuration.',
+      });
+    }
+  });
+
+  // 5. Reset Cloudflare R2 credentials
+  app.post('/api/r2/reset', async (req: Request, res: Response) => {
+    try {
+      clearR2ConfigFile();
+      try {
+        await deleteDoc(doc(firestoreDb, 'event_config', 'r2_config'));
+      } catch {
+        // ignore
+      }
+      const fallbackStatus = getR2Status();
+      return res.json({
+        success: true,
+        cleared: true,
+        message: '✓ Cloudflare R2 credentials reset to defaults.',
+        status: fallbackStatus,
+      });
+    } catch (err: any) {
+      return res.status(500).json({
+        success: false,
+        error: err.message || 'Failed to reset Cloudflare R2 configuration.',
       });
     }
   });

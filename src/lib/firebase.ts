@@ -933,6 +933,92 @@ export async function resetImageKitConfigInCloud(): Promise<void> {
 }
 
 /**
+ * Persists Cloudflare R2 configuration to Cloud Firestore so credentials persist
+ * across server restarts, page refreshes, and multi-device deployments.
+ */
+export async function saveR2ConfigToCloud(config: {
+  accountId: string;
+  accessKeyId: string;
+  secretAccessKey?: string;
+  bucketName: string;
+  publicUrl?: string;
+}): Promise<void> {
+  const acc = (config.accountId || '').trim();
+  const aKey = (config.accessKeyId || '').trim();
+  const sKey = (config.secretAccessKey || '').trim();
+  const bName = (config.bucketName || '').trim();
+  const pubUrl = (config.publicUrl || '').trim();
+
+  // If all fields are empty, delete the R2 configuration document from Firestore
+  if (!acc && !aKey && !sKey && !bName) {
+    await resetR2ConfigInCloud();
+    return;
+  }
+
+  try {
+    const docRef = doc(db, 'event_config', 'r2_config');
+    await setDoc(docRef, {
+      accountId: acc,
+      accessKeyId: aKey,
+      secretAccessKey: sKey,
+      bucketName: bName,
+      publicUrl: pubUrl,
+      updatedAt: new Date().toISOString(),
+    }, { merge: true });
+    recordFirestoreWrites(1);
+  } catch (err) {
+    console.warn('Failed to save Cloudflare R2 config to Firestore:', err);
+  }
+}
+
+/**
+ * Loads Cloudflare R2 configuration from Cloud Firestore.
+ */
+export async function loadR2ConfigFromCloud(): Promise<{
+  accountId: string;
+  accessKeyId: string;
+  secretAccessKey?: string;
+  bucketName: string;
+  publicUrl?: string;
+  updatedAt?: string;
+} | null> {
+  try {
+    const docRef = doc(db, 'event_config', 'r2_config');
+    const snap = await getDoc(docRef);
+    if (snap.exists()) {
+      recordFirestoreReads(1);
+      const data = snap.data();
+      if (data && data.accountId && data.accessKeyId && data.bucketName) {
+        return {
+          accountId: data.accountId || '',
+          accessKeyId: data.accessKeyId || '',
+          secretAccessKey: data.secretAccessKey || '',
+          bucketName: data.bucketName || '',
+          publicUrl: data.publicUrl || '',
+          updatedAt: data.updatedAt,
+        };
+      }
+    }
+  } catch (err) {
+    console.warn('Failed to load Cloudflare R2 config from Firestore:', err);
+  }
+  return null;
+}
+
+/**
+ * Removes Cloudflare R2 configuration from Cloud Firestore.
+ */
+export async function resetR2ConfigInCloud(): Promise<void> {
+  try {
+    const docRef = doc(db, 'event_config', 'r2_config');
+    await deleteDoc(docRef);
+    recordFirestoreDeletes(1);
+  } catch (err) {
+    console.warn('Failed to reset Cloudflare R2 config in Firestore:', err);
+  }
+}
+
+/**
  * Subscribes to real-time updates for guestbook wishes and love entries.
  * Uses Server-Authoritative SSE stream with direct Firestore onSnapshot fallback.
  */

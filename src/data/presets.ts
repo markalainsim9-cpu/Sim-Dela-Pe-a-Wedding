@@ -268,6 +268,16 @@ export const INITIAL_CLOUD_SETTINGS: CloudAccountSettings = {
     "configured": true,
     "uploadFolder": "/wedding-invitations",
     "cdnOptimization": "Global Tier-1 CDN with automatic WebP/AVIF transformation, progressive JPEG loading, lossless compression, and signed client upload authentication"
+  },
+  "r2": {
+    "accountId": "9426f4fce849e75ba9560f855a882cb0",
+    "accessKeyId": "65e6cb7bc4db4e0b5f13426e680a6d09",
+    "secretAccessKey": "810a48b598b9e67d2644265df54b15da3806f156d11ffaa1c69cf720f78cae08",
+    "bucketName": "wedding-videos",
+    "publicUrl": "https://pub-9426f4fce849e75ba9560f855a882cb0.r2.dev",
+    "configured": true,
+    "uploadFolder": "guestbook-videos",
+    "deliveryType": "Cloudflare Global Edge Anycast with zero egress fees, S3 compatibility, presigned ticket uploads, and direct video streaming"
   }
 };
 

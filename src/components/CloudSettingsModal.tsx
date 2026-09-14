@@ -40,7 +40,8 @@ import {
   Download,
   Upload,
   Trash2,
-  Clipboard
+  Clipboard,
+  Video
 } from 'lucide-react';
 import { EventConfig, Guest, GuestbookEntry, SupabaseConfig, SupabaseRedundancyMode, CloudAccountSettings } from '../types';
 import { 
@@ -76,6 +77,14 @@ import {
   maskPrivateKey
 } from '../lib/imagekitClient';
 import { 
+  checkR2Status, 
+  testR2Credentials, 
+  saveR2Credentials, 
+  clearR2Credentials, 
+  maskR2SecretKey,
+  R2StatusResponse
+} from '../utils/r2Client';
+import { 
   getStoredSupabaseConfig, 
   saveStoredSupabaseConfig, 
   saveSupabaseCredentials,
@@ -101,7 +110,7 @@ import { INITIAL_GUESTS, INITIAL_CLOUD_SETTINGS, EVENT_PRESETS } from '../data/p
 interface CloudSettingsModalProps {
   isOpen: boolean;
   onClose: () => void;
-  initialTab?: 'firebase' | 'supabase' | 'imagekit' | 'backup';
+  initialTab?: 'firebase' | 'supabase' | 'imagekit' | 'r2' | 'backup';
   config: EventConfig;
   guests: Guest[];
   guestbookEntries?: GuestbookEntry[];
@@ -121,7 +130,7 @@ export function CloudSettingsModal({
   onSaveGuests,
   isCloudConnected = true,
 }: CloudSettingsModalProps) {
-  const [activeTab, setActiveTab] = useState<'firebase' | 'supabase' | 'imagekit' | 'backup'>(initialTab);
+  const [activeTab, setActiveTab] = useState<'firebase' | 'supabase' | 'imagekit' | 'r2' | 'backup'>(initialTab);
 
   // Sync tab if initialTab changes on open
   useEffect(() => {
@@ -156,6 +165,7 @@ export function CloudSettingsModal({
   const [copiedFirebaseSnippet, setCopiedFirebaseSnippet] = useState(false);
   const [copiedSupabaseSnippet, setCopiedSupabaseSnippet] = useState(false);
   const [copiedImageKitSnippet, setCopiedImageKitSnippet] = useState(false);
+  const [copiedR2Snippet, setCopiedR2Snippet] = useState(false);
   const restoreFileInputRef = React.useRef<HTMLInputElement>(null);
   const [restoreModalData, setRestoreModalData] = useState<{
     isOpen: boolean;
@@ -300,8 +310,10 @@ export function CloudSettingsModal({
   // 1.) Firebase Provisioned Project & Account Details
   // 2.) Supabase Credentials & Redundancy Policy
   // 3.) ImageKit Credentials
+  // 4.) Cloudflare R2 Credentials & Video Storage Settings
   const buildCloudAccountSettings = (maskSecrets: boolean = false): CloudAccountSettings => {
     const ikPriv = (ikPrivateKey || imageKitStatus?.rawPrivateKey || '').trim();
+    const r2Secret = (r2SecretAccessKey || r2Status?.rawSecretAccessKey || '').trim();
     const supaKey = (supabaseConfig.supabaseAnonKey || '').trim();
     const fbKey = firebaseConfig.apiKey || '';
 
@@ -365,6 +377,17 @@ export function CloudSettingsModal({
         configured: Boolean(ikPublicKey.trim() || imageKitStatus?.configured),
         uploadFolder: '/wedding-invitations',
         cdnOptimization: 'Global Tier-1 CDN with automatic WebP/AVIF transformation, progressive JPEG loading, lossless compression, and signed client upload authentication'
+      },
+      // 4.) Cloudflare R2 Credentials & Video Storage Settings
+      r2: {
+        accountId: r2AccountId.trim() || r2Status?.accountId || '9426f4fce849e75ba9560f855a882cb0',
+        accessKeyId: r2AccessKeyId.trim() || r2Status?.accessKeyId || '65e6cb7bc4db4e0b5f13426e680a6d09',
+        secretAccessKey: maskSecrets ? (r2Secret ? maskR2SecretKey(r2Secret) : '') : r2Secret,
+        bucketName: r2BucketName.trim() || r2Status?.bucketName || 'wedding-videos',
+        publicUrl: r2PublicUrl.trim() || r2Status?.publicUrl || 'https://pub-9426f4fce849e75ba9560f855a882cb0.r2.dev',
+        configured: Boolean(r2AccountId.trim() || r2Status?.configured),
+        uploadFolder: 'guestbook-videos',
+        deliveryType: 'Cloudflare Global Edge Anycast with zero egress fees, S3 compatibility, presigned ticket uploads, and direct video streaming'
       }
     };
   };
@@ -401,6 +424,7 @@ export const INITIAL_CLOUD_SETTINGS: CloudAccountSettings = ${JSON.stringify(clo
 // 1.) Firebase Provisioned Project & Account Details
 // 2.) Supabase Credentials & Redundancy Policy
 // 3.) ImageKit Credentials
+// 4.) Cloudflare R2 Credentials & Video Storage Settings
 export const INITIAL_CLOUD_SETTINGS: CloudAccountSettings = ${JSON.stringify(cloudSettings, null, 2)};
 `;
   };
@@ -463,6 +487,16 @@ export const INITIAL_CLOUD_SETTINGS: CloudAccountSettings = ${JSON.stringify(clo
       navigator.clipboard.writeText(code);
       setCopiedImageKitSnippet(true);
       setTimeout(() => setCopiedImageKitSnippet(false), 2500);
+    }
+  };
+
+  const handleCopyR2Snippet = () => {
+    const cloud = buildCloudAccountSettings(maskExportSecrets);
+    const code = `// 4.) Cloudflare R2 Credentials & Video Storage Settings\nexport const R2_CREDENTIALS = ${JSON.stringify(cloud.r2, null, 2)};`;
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(code);
+      setCopiedR2Snippet(true);
+      setTimeout(() => setCopiedR2Snippet(false), 2500);
     }
   };
 
@@ -606,6 +640,14 @@ export const INITIAL_CLOUD_SETTINGS: CloudAccountSettings = ${JSON.stringify(clo
           setIkPrivateKey(newIk.privateKey || '');
           setIkUrlEndpoint(newIk.urlEndpoint || '');
           checkImageKitStatus();
+        },
+        onUpdateR2: (newR2) => {
+          setR2AccountId(newR2.accountId || '');
+          setR2AccessKeyId(newR2.accessKeyId || '');
+          setR2SecretAccessKey(newR2.secretAccessKey || '');
+          setR2BucketName(newR2.bucketName || '');
+          setR2PublicUrl(newR2.publicUrl || '');
+          checkCloudflareR2Status();
         }
       });
 
@@ -960,15 +1002,130 @@ export const INITIAL_CLOUD_SETTINGS: CloudAccountSettings = ${JSON.stringify(clo
     }
   };
 
+  // --- CLOUDFLARE R2 STATE & HANDLERS ---
+  const [r2Status, setR2Status] = useState<R2StatusResponse | null>(null);
+  const [isCheckingR2, setIsCheckingR2] = useState(false);
+
+  const [r2AccountId, setR2AccountId] = useState('');
+  const [r2AccessKeyId, setR2AccessKeyId] = useState('');
+  const [r2SecretAccessKey, setR2SecretAccessKey] = useState('');
+  const [r2BucketName, setR2BucketName] = useState('');
+  const [r2PublicUrl, setR2PublicUrl] = useState('');
+  const [r2ShowSecretKey, setR2ShowSecretKey] = useState(false);
+  const [r2IsSaving, setR2IsSaving] = useState(false);
+  const [r2IsTesting, setR2IsTesting] = useState(false);
+  const [r2IsResetting, setR2IsResetting] = useState(false);
+  const [r2SaveResult, setR2SaveResult] = useState<{ success: boolean; message: string } | null>(null);
+  const [r2TestResult, setR2TestResult] = useState<{ success: boolean; message: string } | null>(null);
+
+  const checkCloudflareR2Status = async () => {
+    try {
+      setIsCheckingR2(true);
+      const data = await checkR2Status();
+      setR2Status(data);
+      setR2AccountId(data.accountId || '');
+      setR2AccessKeyId(data.accessKeyId || '');
+      setR2SecretAccessKey(data.rawSecretAccessKey || '');
+      setR2BucketName(data.bucketName || '');
+      setR2PublicUrl(data.publicUrl || '');
+    } catch (err) {
+      console.warn('R2 status check fallback:', err);
+    } finally {
+      setIsCheckingR2(false);
+    }
+  };
+
+  useEffect(() => {
+    if (isOpen) {
+      checkCloudflareR2Status();
+    }
+  }, [isOpen]);
+
+  const handleTestR2 = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    setR2IsTesting(true);
+    setR2TestResult(null);
+    try {
+      const secretKeyToUse = r2SecretAccessKey.trim() || r2Status?.rawSecretAccessKey || '';
+      const result = await testR2Credentials({
+        accountId: r2AccountId.trim(),
+        accessKeyId: r2AccessKeyId.trim(),
+        secretAccessKey: secretKeyToUse,
+        bucketName: r2BucketName.trim(),
+        publicUrl: r2PublicUrl.trim()
+      });
+      setR2TestResult(result);
+    } catch (err: any) {
+      setR2TestResult({
+        success: false,
+        message: err.message || 'Error occurred while testing Cloudflare R2 connection.'
+      });
+    } finally {
+      setR2IsTesting(false);
+    }
+  };
+
+  const handleSaveR2 = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    setR2IsSaving(true);
+    setR2SaveResult(null);
+    try {
+      const secretToSave = r2SecretAccessKey.trim() || r2Status?.rawSecretAccessKey || '';
+      const result = await saveR2Credentials({
+        accountId: r2AccountId.trim(),
+        accessKeyId: r2AccessKeyId.trim(),
+        secretAccessKey: secretToSave,
+        bucketName: r2BucketName.trim(),
+        publicUrl: r2PublicUrl.trim()
+      });
+      setR2SaveResult(result);
+      if (result.success) {
+        await checkCloudflareR2Status();
+      }
+    } catch (err: any) {
+      setR2SaveResult({
+        success: false,
+        message: err.message || 'Network error while saving Cloudflare R2 credentials.'
+      });
+    } finally {
+      setR2IsSaving(false);
+    }
+  };
+
+  const handleResetR2 = async () => {
+    if (!window.confirm('Delete Cloudflare R2 credentials? This will permanently remove R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME, and R2_PUBLIC_URL from Cloud Firestore, server, and browser storage.')) return;
+    setR2IsResetting(true);
+    setR2SaveResult(null);
+    try {
+      const result = await clearR2Credentials();
+      setR2SaveResult(result);
+      setR2AccountId('');
+      setR2AccessKeyId('');
+      setR2SecretAccessKey('');
+      setR2BucketName('');
+      setR2PublicUrl('');
+      await checkCloudflareR2Status();
+    } catch (err: any) {
+      setR2SaveResult({
+        success: false,
+        message: err.message || 'Failed to delete Cloudflare R2 credentials.'
+      });
+    } finally {
+      setR2IsResetting(false);
+    }
+  };
+
   // Render comprehensive Codebase Presets & Backup Suite including:
   // 1.) Firebase Provisioned Project & Account Details
   // 2.) Supabase Credentials & Redundancy Policy
   // 3.) ImageKit Credentials
+  // 4.) Cloudflare R2 Video Storage Credentials
   const renderPresetsAndBackupSuite = (isDedicatedTab: boolean = false) => {
     const cloud = buildCloudAccountSettings(maskExportSecrets);
     const supaKey = (supabaseConfig.supabaseAnonKey || '').trim();
     const fbKey = firebaseConfig.apiKey || '';
     const ikPriv = (ikPrivateKey || imageKitStatus?.rawPrivateKey || '').trim();
+    const r2Secret = (r2SecretAccessKey || r2Status?.rawSecretAccessKey || '').trim();
 
     return (
       <div className={`space-y-4 ${isDedicatedTab ? '' : 'pt-3 border-t border-emerald-200/80'}`}>
@@ -981,11 +1138,11 @@ export const INITIAL_CLOUD_SETTINGS: CloudAccountSettings = ${JSON.stringify(clo
                 <span>Codebase Presets & Backup Suite</span>
               </span>
               <span className="px-2 py-0.5 rounded-full text-[10px] font-sans font-bold bg-emerald-100 text-emerald-800 border border-emerald-300">
-                Cloud-Integrated v3.0
+                Cloud-Integrated v3.0 (4 Clouds)
               </span>
             </div>
             <p className="text-xs text-[#475569] mt-0.5 max-w-2xl">
-              Unified recovery package and code generator. Incorporates all current wedding configurations, guest list & seating assignments, keepsake guestbook wishes, alongside authoritative cloud account infrastructure across Firebase, Supabase, and ImageKit.
+              Unified recovery package and code generator. Incorporates all current wedding configurations, guest list & seating assignments, keepsake guestbook wishes, alongside authoritative cloud account infrastructure across Firebase, Supabase, ImageKit, and Cloudflare R2.
             </p>
           </div>
 
@@ -1001,81 +1158,103 @@ export const INITIAL_CLOUD_SETTINGS: CloudAccountSettings = ${JSON.stringify(clo
           </div>
         </div>
 
-        {/* 3 CLOUD & ACCOUNT PILLARS BENTO GRID */}
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+        {/* 4 CLOUD & ACCOUNT PILLARS BENTO GRID */}
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 sm:gap-5">
           {/* Pillar 1: Firebase Provisioned Project & Account Details */}
-          <div className="p-3.5 bg-[#ffffff] rounded-2xl border border-amber-200/90 shadow-xs flex flex-col justify-between space-y-3">
-            <div className="space-y-2">
-              <div className="flex items-center justify-between">
-                <span className="inline-flex items-center gap-1.5 text-xs font-bold text-amber-950">
-                  <Flame className="w-4 h-4 text-amber-600 shrink-0" />
-                  <span>1.) Firebase Provisioned Account</span>
-                </span>
-                <span className="px-1.5 py-0.5 rounded text-[10px] font-sans font-bold bg-amber-50 text-amber-800 border border-amber-200">
-                  Authoritative
+          <div className="p-4 sm:p-5 bg-white rounded-2xl border border-amber-200/90 shadow-xs flex flex-col justify-between space-y-4 hover:shadow-md transition-shadow">
+            <div className="space-y-3">
+              <div className="flex items-start justify-between gap-2">
+                <div className="flex items-center gap-2.5">
+                  <div className="w-9 h-9 rounded-xl bg-amber-500/10 border border-amber-500/20 flex items-center justify-center text-amber-600 shrink-0">
+                    <Flame className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <h4 className="text-sm font-bold text-amber-950 font-serif flex items-center gap-1.5">
+                      1.) Firebase Provisioned Account
+                    </h4>
+                    <p className="text-[11px] text-slate-500 font-sans">
+                      Google Cloud Firestore • Live SSE Real-Time Sync
+                    </p>
+                  </div>
+                </div>
+                <span className="px-2.5 py-0.5 rounded-full text-[11px] font-sans font-bold bg-amber-50 text-amber-800 border border-amber-200 shrink-0">
+                  Authoritative Primary
                 </span>
               </div>
 
-              <p className="text-[11px] text-[#506173] leading-relaxed">
-                Authoritative Google Cloud Firestore project with live Server-Sent Events (SSE) streaming and real-time client listener sync.
+              <p className="text-xs text-[#506173] leading-relaxed">
+                Authoritative Google Cloud Firestore project with live Server-Sent Events (SSE) streaming, real-time client listener sync, and instant persistence.
               </p>
 
-              <div className="space-y-1.5 pt-1 text-[11px] font-mono">
-                <div className="flex items-center justify-between p-1.5 bg-[#f8fafc] rounded-lg border border-slate-200">
-                  <span className="text-slate-500 text-[10px] uppercase font-sans font-semibold">Project ID:</span>
-                  <div className="flex items-center gap-1">
-                    <span className="text-slate-800 font-semibold truncate max-w-[140px]" title={firebaseConfig.projectId}>
-                      {firebaseConfig.projectId}
-                    </span>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs font-mono">
+                <div className="p-2.5 bg-[#f8fafc] rounded-xl border border-slate-200/80 flex flex-col justify-between min-w-0">
+                  <div className="flex items-center justify-between gap-1 mb-1">
+                    <span className="text-slate-500 text-[10px] uppercase font-sans font-bold tracking-wider">Project ID</span>
                     <button
                       type="button"
                       onClick={() => handleCopyText(firebaseConfig.projectId, 'fb_proj')}
-                      className="p-1 hover:bg-slate-200 rounded text-slate-600"
+                      className="p-1 hover:bg-slate-200 rounded text-slate-500 hover:text-slate-800 transition"
                       title="Copy Project ID"
                     >
-                      {copiedField === 'fb_proj' ? <Check className="w-3 h-3 text-emerald-600" /> : <Copy className="w-3 h-3" />}
+                      {copiedField === 'fb_proj' ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
                     </button>
                   </div>
+                  <span className="text-slate-900 font-semibold truncate text-xs" title={firebaseConfig.projectId}>
+                    {firebaseConfig.projectId}
+                  </span>
                 </div>
 
-                <div className="flex items-center justify-between p-1.5 bg-[#f8fafc] rounded-lg border border-slate-200">
-                  <span className="text-slate-500 text-[10px] uppercase font-sans font-semibold">Database ID:</span>
-                  <div className="flex items-center gap-1">
-                    <span className="text-slate-800 truncate max-w-[130px]" title={firebaseConfig.firestoreDatabaseId || '(default)'}>
-                      {firebaseConfig.firestoreDatabaseId ? maskId(firebaseConfig.firestoreDatabaseId, 8, 4) : '(default)'}
-                    </span>
+                <div className="p-2.5 bg-[#f8fafc] rounded-xl border border-slate-200/80 flex flex-col justify-between min-w-0">
+                  <div className="flex items-center justify-between gap-1 mb-1">
+                    <span className="text-slate-500 text-[10px] uppercase font-sans font-bold tracking-wider">Database ID</span>
                     <button
                       type="button"
-                      onClick={() => handleCopyText(firebaseConfig.firestoreDatabaseId, 'fb_db')}
-                      className="p-1 hover:bg-slate-200 rounded text-slate-600"
+                      onClick={() => handleCopyText(firebaseConfig.firestoreDatabaseId || '', 'fb_db')}
+                      className="p-1 hover:bg-slate-200 rounded text-slate-500 hover:text-slate-800 transition"
                       title="Copy Firestore Database ID"
                     >
-                      {copiedField === 'fb_db' ? <Check className="w-3 h-3 text-emerald-600" /> : <Copy className="w-3 h-3" />}
+                      {copiedField === 'fb_db' ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
                     </button>
                   </div>
+                  <span className="text-slate-900 font-semibold truncate text-xs" title={firebaseConfig.firestoreDatabaseId || '(default)'}>
+                    {firebaseConfig.firestoreDatabaseId || '(default)'}
+                  </span>
                 </div>
 
-                <div className="flex items-center justify-between p-1.5 bg-[#f8fafc] rounded-lg border border-slate-200">
-                  <span className="text-slate-500 text-[10px] uppercase font-sans font-semibold">App ID:</span>
-                  <span className="text-slate-800 truncate max-w-[140px]" title={firebaseConfig.appId}>
+                <div className="p-2.5 bg-[#f8fafc] rounded-xl border border-slate-200/80 flex flex-col justify-between min-w-0">
+                  <div className="flex items-center justify-between gap-1 mb-1">
+                    <span className="text-slate-500 text-[10px] uppercase font-sans font-bold tracking-wider">App ID</span>
+                    <button
+                      type="button"
+                      onClick={() => handleCopyText(firebaseConfig.appId, 'fb_app')}
+                      className="p-1 hover:bg-slate-200 rounded text-slate-500 hover:text-slate-800 transition"
+                      title="Copy App ID"
+                    >
+                      {copiedField === 'fb_app' ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
+                    </button>
+                  </div>
+                  <span className="text-slate-900 font-mono truncate text-xs" title={firebaseConfig.appId}>
                     {maskId(firebaseConfig.appId, 8, 4)}
                   </span>
                 </div>
 
-                <div className="flex items-center justify-between p-1.5 bg-[#f8fafc] rounded-lg border border-slate-200">
-                  <span className="text-slate-500 text-[10px] uppercase font-sans font-semibold">Plan & Quota:</span>
-                  <span className="text-emerald-700 font-sans font-semibold text-[10px]">
+                <div className="p-2.5 bg-[#f8fafc] rounded-xl border border-slate-200/80 flex flex-col justify-between min-w-0">
+                  <div className="flex items-center justify-between gap-1 mb-1">
+                    <span className="text-slate-500 text-[10px] uppercase font-sans font-bold tracking-wider">Plan & Quota</span>
+                    <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" title="Healthy" />
+                  </div>
+                  <span className="text-emerald-700 font-sans font-semibold text-xs truncate" title="Spark Tier: 50k reads / 20k writes daily">
                     Spark Tier (50k/20k daily)
                   </span>
                 </div>
               </div>
             </div>
 
-            <div className="pt-2 border-t border-slate-100 flex items-center justify-between gap-1.5">
+            <div className="pt-3 border-t border-slate-100 flex items-center justify-between gap-2">
               <button
                 type="button"
                 onClick={handleCopyFirebaseSnippet}
-                className="px-2.5 py-1.5 rounded-lg text-xs font-semibold bg-amber-50 hover:bg-amber-100 text-amber-900 border border-amber-300 transition flex items-center gap-1 w-full justify-center"
+                className="px-3 py-2 rounded-xl text-xs font-semibold bg-amber-50 hover:bg-amber-100 text-amber-900 border border-amber-300 transition flex items-center gap-1.5 flex-1 justify-center shadow-2xs"
               >
                 {copiedFirebaseSnippet ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5 text-amber-700" />}
                 <span>{copiedFirebaseSnippet ? 'Copied Details' : 'Copy Firebase Details'}</span>
@@ -1084,23 +1263,33 @@ export const INITIAL_CLOUD_SETTINGS: CloudAccountSettings = ${JSON.stringify(clo
                 href={cloud.firebase.consoleUrl}
                 target="_blank"
                 rel="noopener noreferrer"
-                className="p-1.5 rounded-lg text-amber-800 hover:bg-amber-100 border border-amber-200 transition"
+                className="px-3 py-2 rounded-xl text-xs font-semibold text-amber-800 hover:bg-amber-100 border border-amber-200 transition flex items-center gap-1.5 shrink-0"
                 title="Open Firebase Console"
               >
+                <span>Console</span>
                 <ExternalLink className="w-3.5 h-3.5" />
               </a>
             </div>
           </div>
 
           {/* Pillar 2: Supabase Credentials & Redundancy Policy */}
-          <div className="p-3.5 bg-[#ffffff] rounded-2xl border border-emerald-200/90 shadow-xs flex flex-col justify-between space-y-3">
-            <div className="space-y-2">
-              <div className="flex items-center justify-between">
-                <span className="inline-flex items-center gap-1.5 text-xs font-bold text-emerald-950">
-                  <ArrowRightLeft className="w-4 h-4 text-emerald-600 shrink-0" />
-                  <span>2.) Supabase Redundancy Policy</span>
-                </span>
-                <span className={`px-1.5 py-0.5 rounded text-[10px] font-sans font-bold ${
+          <div className="p-4 sm:p-5 bg-white rounded-2xl border border-emerald-200/90 shadow-xs flex flex-col justify-between space-y-4 hover:shadow-md transition-shadow">
+            <div className="space-y-3">
+              <div className="flex items-start justify-between gap-2">
+                <div className="flex items-center gap-2.5">
+                  <div className="w-9 h-9 rounded-xl bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center text-emerald-600 shrink-0">
+                    <ArrowRightLeft className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <h4 className="text-sm font-bold text-emerald-950 font-serif flex items-center gap-1.5">
+                      2.) Supabase Redundancy Policy
+                    </h4>
+                    <p className="text-[11px] text-slate-500 font-sans">
+                      PostgreSQL Replica • Automatic Failover & Mirror
+                    </p>
+                  </div>
+                </div>
+                <span className={`px-2.5 py-0.5 rounded-full text-[11px] font-sans font-bold shrink-0 ${
                   supabaseConfig.mode === 'mirror'
                     ? 'bg-emerald-100 text-emerald-800 border border-emerald-300'
                     : supabaseConfig.mode === 'failover'
@@ -1111,142 +1300,289 @@ export const INITIAL_CLOUD_SETTINGS: CloudAccountSettings = ${JSON.stringify(clo
                 </span>
               </div>
 
-              <p className="text-[11px] text-[#506173] leading-relaxed">
-                PostgreSQL redundancy for failover and continuous dual-writes across <code>wedding_config</code>, <code>guests</code>, and <code>guestbook_entries</code>.
+              <p className="text-xs text-[#506173] leading-relaxed">
+                PostgreSQL redundancy for failover and continuous dual-writes across wedding configuration, guest RSVP lists, and guestbook wishes.
               </p>
 
-              <div className="space-y-1.5 pt-1 text-[11px] font-mono">
-                <div className="flex items-center justify-between p-1.5 bg-[#f8fafc] rounded-lg border border-slate-200">
-                  <span className="text-slate-500 text-[10px] uppercase font-sans font-semibold">Project URL:</span>
-                  <div className="flex items-center gap-1">
-                    <span className="text-slate-800 truncate max-w-[130px]" title={supabaseConfig.supabaseUrl || 'Scaffolding Ready'}>
-                      {supabaseConfig.supabaseUrl ? maskDomain(supabaseConfig.supabaseUrl, 8) : 'Scaffolding Ready'}
-                    </span>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs font-mono">
+                <div className="p-2.5 bg-[#f8fafc] rounded-xl border border-slate-200/80 flex flex-col justify-between min-w-0">
+                  <div className="flex items-center justify-between gap-1 mb-1">
+                    <span className="text-slate-500 text-[10px] uppercase font-sans font-bold tracking-wider">Project URL</span>
                     {supabaseConfig.supabaseUrl && (
                       <button
                         type="button"
                         onClick={() => handleCopyText(supabaseConfig.supabaseUrl, 'sb_url')}
-                        className="p-1 hover:bg-slate-200 rounded text-slate-600"
+                        className="p-1 hover:bg-slate-200 rounded text-slate-500 hover:text-slate-800 transition"
                         title="Copy Supabase URL"
                       >
-                        {copiedField === 'sb_url' ? <Check className="w-3 h-3 text-emerald-600" /> : <Copy className="w-3 h-3" />}
+                        {copiedField === 'sb_url' ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
                       </button>
                     )}
                   </div>
+                  <span className="text-slate-900 font-semibold truncate text-xs" title={supabaseConfig.supabaseUrl || 'Scaffolding Ready'}>
+                    {supabaseConfig.supabaseUrl ? maskDomain(supabaseConfig.supabaseUrl, 10) : 'Scaffolding Ready'}
+                  </span>
                 </div>
 
-                <div className="flex items-center justify-between p-1.5 bg-[#f8fafc] rounded-lg border border-slate-200">
-                  <span className="text-slate-500 text-[10px] uppercase font-sans font-semibold">Anon Key:</span>
-                  <span className="text-slate-800 truncate max-w-[140px]">
+                <div className="p-2.5 bg-[#f8fafc] rounded-xl border border-slate-200/80 flex flex-col justify-between min-w-0">
+                  <div className="flex items-center justify-between gap-1 mb-1">
+                    <span className="text-slate-500 text-[10px] uppercase font-sans font-bold tracking-wider">Anon Key</span>
+                    {supaKey && (
+                      <button
+                        type="button"
+                        onClick={() => handleCopyText(supaKey, 'sb_key')}
+                        className="p-1 hover:bg-slate-200 rounded text-slate-500 hover:text-slate-800 transition"
+                        title="Copy Anon Key"
+                      >
+                        {copiedField === 'sb_key' ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
+                      </button>
+                    )}
+                  </div>
+                  <span className="text-slate-900 truncate text-xs font-sans" title={supaKey ? 'Configured' : 'Local default'}>
                     {supaKey ? (maskExportSecrets ? '••••••••••••' : maskId(supaKey, 6, 4)) : 'Local default'}
                   </span>
                 </div>
 
-                <div className="flex items-center justify-between p-1.5 bg-[#f8fafc] rounded-lg border border-slate-200">
-                  <span className="text-slate-500 text-[10px] uppercase font-sans font-semibold">Auto-Failover:</span>
-                  <span className={`font-sans font-semibold text-[10px] ${supabaseConfig.autoFailover ? 'text-emerald-700' : 'text-slate-500'}`}>
-                    {supabaseConfig.autoFailover ? 'Active (Auto-switches)' : 'Disabled'}
+                <div className="p-2.5 bg-[#f8fafc] rounded-xl border border-slate-200/80 flex flex-col justify-between min-w-0">
+                  <div className="flex items-center justify-between gap-1 mb-1">
+                    <span className="text-slate-500 text-[10px] uppercase font-sans font-bold tracking-wider">Auto-Failover</span>
+                    <span className={`w-2 h-2 rounded-full ${supabaseConfig.autoFailover ? 'bg-emerald-500 animate-pulse' : 'bg-slate-400'}`} />
+                  </div>
+                  <span className={`font-sans font-semibold text-xs ${supabaseConfig.autoFailover ? 'text-emerald-700' : 'text-slate-500'}`}>
+                    {supabaseConfig.autoFailover ? 'Active (Auto-switches)' : 'Manual Switch'}
                   </span>
                 </div>
 
-                <div className="flex items-center justify-between p-1.5 bg-[#f8fafc] rounded-lg border border-slate-200">
-                  <span className="text-slate-500 text-[10px] uppercase font-sans font-semibold">Sync Policy:</span>
-                  <span className="text-slate-700 font-sans text-[10px] truncate max-w-[130px]" title="Last-Write-Wins (LWW) with ISO-8601 atomic batching">
+                <div className="p-2.5 bg-[#f8fafc] rounded-xl border border-slate-200/80 flex flex-col justify-between min-w-0">
+                  <div className="flex items-center justify-between gap-1 mb-1">
+                    <span className="text-slate-500 text-[10px] uppercase font-sans font-bold tracking-wider">Sync Policy</span>
+                  </div>
+                  <span className="text-slate-800 font-sans font-semibold text-xs truncate" title="Last-Write-Wins (LWW) with ISO-8601 atomic batching">
                     LWW with ISO timestamps
                   </span>
                 </div>
               </div>
             </div>
 
-            <div className="pt-2 border-t border-slate-100">
+            <div className="pt-3 border-t border-slate-100 flex items-center justify-between gap-2">
               <button
                 type="button"
                 onClick={handleCopySupabaseSnippet}
-                className="px-2.5 py-1.5 rounded-lg text-xs font-semibold bg-emerald-50 hover:bg-emerald-100 text-emerald-900 border border-emerald-300 transition flex items-center gap-1 w-full justify-center"
+                className="px-3 py-2 rounded-xl text-xs font-semibold bg-emerald-50 hover:bg-emerald-100 text-emerald-900 border border-emerald-300 transition flex items-center gap-1.5 flex-1 justify-center shadow-2xs"
               >
                 {copiedSupabaseSnippet ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5 text-emerald-700" />}
                 <span>{copiedSupabaseSnippet ? 'Copied Policy' : 'Copy Supabase Policy'}</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setActiveTab('supabase')}
+                className="px-3 py-2 rounded-xl text-xs font-semibold text-emerald-800 hover:bg-emerald-100 border border-emerald-200 transition shrink-0"
+              >
+                Manage Tab
               </button>
             </div>
           </div>
 
           {/* Pillar 3: ImageKit Credentials */}
-          <div className="p-3.5 bg-[#ffffff] rounded-2xl border border-sky-200/90 shadow-xs flex flex-col justify-between space-y-3">
-            <div className="space-y-2">
-              <div className="flex items-center justify-between">
-                <span className="inline-flex items-center gap-1.5 text-xs font-bold text-sky-950">
-                  <Cloud className="w-4 h-4 text-sky-600 shrink-0" />
-                  <span>3.) ImageKit Credentials</span>
-                </span>
-                <span className="px-1.5 py-0.5 rounded text-[10px] font-sans font-bold bg-sky-100 text-sky-800 border border-sky-300">
+          <div className="p-4 sm:p-5 bg-white rounded-2xl border border-sky-200/90 shadow-xs flex flex-col justify-between space-y-4 hover:shadow-md transition-shadow">
+            <div className="space-y-3">
+              <div className="flex items-start justify-between gap-2">
+                <div className="flex items-center gap-2.5">
+                  <div className="w-9 h-9 rounded-xl bg-sky-500/10 border border-sky-500/20 flex items-center justify-center text-sky-600 shrink-0">
+                    <Cloud className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <h4 className="text-sm font-bold text-sky-950 font-serif flex items-center gap-1.5">
+                      3.) ImageKit Credentials
+                    </h4>
+                    <p className="text-[11px] text-slate-500 font-sans">
+                      Global Tier-1 Media CDN • Real-Time Transforms
+                    </p>
+                  </div>
+                </div>
+                <span className="px-2.5 py-0.5 rounded-full text-[11px] font-sans font-bold bg-sky-100 text-sky-800 border border-sky-300 shrink-0">
                   Global CDN
                 </span>
               </div>
 
-              <p className="text-[11px] text-[#506173] leading-relaxed">
+              <p className="text-xs text-[#506173] leading-relaxed">
                 Tier-1 CDN image delivery with auto-WebP/AVIF transforms, progressive loading, and client signature auth via <code>/api/imagekit/auth</code>.
               </p>
 
-              <div className="space-y-1.5 pt-1 text-[11px] font-mono">
-                <div className="flex items-center justify-between p-1.5 bg-[#f8fafc] rounded-lg border border-slate-200">
-                  <span className="text-slate-500 text-[10px] uppercase font-sans font-semibold">Public Key:</span>
-                  <div className="flex items-center gap-1">
-                    <span className="text-slate-800 truncate max-w-[130px]" title={ikPublicKey || imageKitStatus?.publicKey || 'Configured'}>
-                      {ikPublicKey ? maskId(ikPublicKey, 8, 4) : 'public_vie7...'}
-                    </span>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs font-mono">
+                <div className="p-2.5 bg-[#f8fafc] rounded-xl border border-slate-200/80 flex flex-col justify-between min-w-0">
+                  <div className="flex items-center justify-between gap-1 mb-1">
+                    <span className="text-slate-500 text-[10px] uppercase font-sans font-bold tracking-wider">Public Key</span>
                     <button
                       type="button"
                       onClick={() => handleCopyText(ikPublicKey || imageKitStatus?.publicKey || 'public_vie7nQLXXCidvyqXsEkC9qnkwWk=', 'ik_pub')}
-                      className="p-1 hover:bg-slate-200 rounded text-slate-600"
+                      className="p-1 hover:bg-slate-200 rounded text-slate-500 hover:text-slate-800 transition"
                       title="Copy Public Key"
                     >
-                      {copiedField === 'ik_pub' ? <Check className="w-3 h-3 text-emerald-600" /> : <Copy className="w-3 h-3" />}
+                      {copiedField === 'ik_pub' ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
                     </button>
                   </div>
+                  <span className="text-slate-900 font-semibold truncate text-xs" title={ikPublicKey || imageKitStatus?.publicKey || 'Configured'}>
+                    {ikPublicKey ? maskId(ikPublicKey, 8, 4) : 'public_vie7...'}
+                  </span>
                 </div>
 
-                <div className="flex items-center justify-between p-1.5 bg-[#f8fafc] rounded-lg border border-slate-200">
-                  <span className="text-slate-500 text-[10px] uppercase font-sans font-semibold">URL Endpoint:</span>
-                  <div className="flex items-center gap-1">
-                    <span className="text-slate-800 truncate max-w-[125px]" title={ikUrlEndpoint || imageKitStatus?.urlEndpoint || 'https://ik.imagekit.io/9abzbu5ke'}>
-                      {maskDomain(ikUrlEndpoint || imageKitStatus?.urlEndpoint || 'https://ik.imagekit.io/9abzbu5ke', 12)}
-                    </span>
+                <div className="p-2.5 bg-[#f8fafc] rounded-xl border border-slate-200/80 flex flex-col justify-between min-w-0">
+                  <div className="flex items-center justify-between gap-1 mb-1">
+                    <span className="text-slate-500 text-[10px] uppercase font-sans font-bold tracking-wider">URL Endpoint</span>
                     <button
                       type="button"
                       onClick={() => handleCopyText(ikUrlEndpoint || imageKitStatus?.urlEndpoint || 'https://ik.imagekit.io/9abzbu5ke', 'ik_url')}
-                      className="p-1 hover:bg-slate-200 rounded text-slate-600"
+                      className="p-1 hover:bg-slate-200 rounded text-slate-500 hover:text-slate-800 transition"
                       title="Copy Endpoint URL"
                     >
-                      {copiedField === 'ik_url' ? <Check className="w-3 h-3 text-emerald-600" /> : <Copy className="w-3 h-3" />}
+                      {copiedField === 'ik_url' ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
                     </button>
                   </div>
+                  <span className="text-slate-900 font-semibold truncate text-xs" title={ikUrlEndpoint || imageKitStatus?.urlEndpoint || 'https://ik.imagekit.io/9abzbu5ke'}>
+                    {maskDomain(ikUrlEndpoint || imageKitStatus?.urlEndpoint || 'https://ik.imagekit.io/9abzbu5ke', 12)}
+                  </span>
                 </div>
 
-                <div className="flex items-center justify-between p-1.5 bg-[#f8fafc] rounded-lg border border-slate-200">
-                  <span className="text-slate-500 text-[10px] uppercase font-sans font-semibold">Private Key:</span>
-                  <span className="text-slate-800 font-sans text-[10px]">
+                <div className="p-2.5 bg-[#f8fafc] rounded-xl border border-slate-200/80 flex flex-col justify-between min-w-0">
+                  <div className="flex items-center justify-between gap-1 mb-1">
+                    <span className="text-slate-500 text-[10px] uppercase font-sans font-bold tracking-wider">Private Key</span>
+                  </div>
+                  <span className="text-slate-800 font-sans font-semibold text-xs truncate">
                     {ikPriv ? (maskExportSecrets ? '••••••••••••' : 'Configured (Encrypted)') : 'Scaffold/Server'}
                   </span>
                 </div>
 
-                <div className="flex items-center justify-between p-1.5 bg-[#f8fafc] rounded-lg border border-slate-200">
-                  <span className="text-slate-500 text-[10px] uppercase font-sans font-semibold">Target Folder:</span>
-                  <span className="text-slate-800 font-sans text-[10px]">
+                <div className="p-2.5 bg-[#f8fafc] rounded-xl border border-slate-200/80 flex flex-col justify-between min-w-0">
+                  <div className="flex items-center justify-between gap-1 mb-1">
+                    <span className="text-slate-500 text-[10px] uppercase font-sans font-bold tracking-wider">Target Folder</span>
+                  </div>
+                  <span className="text-slate-800 font-sans font-semibold text-xs truncate">
                     /wedding-invitations
                   </span>
                 </div>
               </div>
             </div>
 
-            <div className="pt-2 border-t border-slate-100">
+            <div className="pt-3 border-t border-slate-100 flex items-center justify-between gap-2">
               <button
                 type="button"
                 onClick={handleCopyImageKitSnippet}
-                className="px-2.5 py-1.5 rounded-lg text-xs font-semibold bg-sky-50 hover:bg-sky-100 text-sky-900 border border-sky-300 transition flex items-center gap-1 w-full justify-center"
+                className="px-3 py-2 rounded-xl text-xs font-semibold bg-sky-50 hover:bg-sky-100 text-sky-900 border border-sky-300 transition flex items-center gap-1.5 flex-1 justify-center shadow-2xs"
               >
                 {copiedImageKitSnippet ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5 text-sky-700" />}
                 <span>{copiedImageKitSnippet ? 'Copied ImageKit' : 'Copy ImageKit Config'}</span>
               </button>
+              <button
+                type="button"
+                onClick={() => setActiveTab('imagekit')}
+                className="px-3 py-2 rounded-xl text-xs font-semibold text-sky-800 hover:bg-sky-100 border border-sky-200 transition shrink-0"
+              >
+                Manage Tab
+              </button>
+            </div>
+          </div>
+
+          {/* Pillar 4: Cloudflare R2 Video Storage */}
+          <div className="p-4 sm:p-5 bg-white rounded-2xl border border-amber-200/90 shadow-xs flex flex-col justify-between space-y-4 hover:shadow-md transition-shadow">
+            <div className="space-y-3">
+              <div className="flex items-start justify-between gap-2">
+                <div className="flex items-center gap-2.5">
+                  <div className="w-9 h-9 rounded-xl bg-amber-500/10 border border-amber-500/20 flex items-center justify-center text-amber-600 shrink-0">
+                    <Video className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <h4 className="text-sm font-bold text-amber-950 font-serif flex items-center gap-1.5">
+                      4.) Cloudflare R2
+                    </h4>
+                    <p className="text-[11px] text-slate-500 font-sans">
+                      S3-Compatible Edge Storage • Zero Egress Fees
+                    </p>
+                  </div>
+                </div>
+                <span className="px-2.5 py-0.5 rounded-full text-[11px] font-sans font-bold bg-amber-100 text-amber-800 border border-amber-300 shrink-0">
+                  Zero Egress
+                </span>
+              </div>
+
+              <p className="text-xs text-[#506173] leading-relaxed">
+                Cloudflare edge S3-compatible storage for high-res guestbook video blessings with zero egress fees and direct signed uploads.
+              </p>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs font-mono">
+                <div className="p-2.5 bg-[#f8fafc] rounded-xl border border-slate-200/80 flex flex-col justify-between min-w-0">
+                  <div className="flex items-center justify-between gap-1 mb-1">
+                    <span className="text-slate-500 text-[10px] uppercase font-sans font-bold tracking-wider">Account ID</span>
+                    <button
+                      type="button"
+                      onClick={() => handleCopyText(r2AccountId || r2Status?.accountId || '9426f4fce849e75ba9560f855a882cb0', 'r2_acc')}
+                      className="p-1 hover:bg-slate-200 rounded text-slate-500 hover:text-slate-800 transition"
+                      title="Copy Account ID"
+                    >
+                      {copiedField === 'r2_acc' ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
+                    </button>
+                  </div>
+                  <span className="text-slate-900 font-semibold truncate text-xs" title={r2AccountId || r2Status?.accountId || 'Configured'}>
+                    {r2AccountId || r2Status?.accountId ? maskId(r2AccountId || r2Status?.accountId || '', 8, 4) : '9426f4fc...'}
+                  </span>
+                </div>
+
+                <div className="p-2.5 bg-[#f8fafc] rounded-xl border border-slate-200/80 flex flex-col justify-between min-w-0">
+                  <div className="flex items-center justify-between gap-1 mb-1">
+                    <span className="text-slate-500 text-[10px] uppercase font-sans font-bold tracking-wider">Bucket</span>
+                    <button
+                      type="button"
+                      onClick={() => handleCopyText(r2BucketName || r2Status?.bucketName || 'wedding-videos', 'r2_bucket')}
+                      className="p-1 hover:bg-slate-200 rounded text-slate-500 hover:text-slate-800 transition"
+                      title="Copy Bucket Name"
+                    >
+                      {copiedField === 'r2_bucket' ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
+                    </button>
+                  </div>
+                  <span className="text-slate-900 font-semibold truncate text-xs" title={r2BucketName || r2Status?.bucketName || 'wedding-videos'}>
+                    {r2BucketName || r2Status?.bucketName || 'wedding-videos'}
+                  </span>
+                </div>
+
+                <div className="p-2.5 bg-[#f8fafc] rounded-xl border border-slate-200/80 flex flex-col justify-between min-w-0">
+                  <div className="flex items-center justify-between gap-1 mb-1">
+                    <span className="text-slate-500 text-[10px] uppercase font-sans font-bold tracking-wider">Secret Key</span>
+                  </div>
+                  <span className="text-slate-800 font-sans font-semibold text-xs truncate">
+                    {r2Status?.hasSecretAccessKey || r2SecretAccessKey ? (maskExportSecrets ? '••••••••••••' : 'Configured (Encrypted)') : 'Scaffold/Server'}
+                  </span>
+                </div>
+
+                <div className="p-2.5 bg-[#f8fafc] rounded-xl border border-slate-200/80 flex flex-col justify-between min-w-0">
+                  <div className="flex items-center justify-between gap-1 mb-1">
+                    <span className="text-slate-500 text-[10px] uppercase font-sans font-bold tracking-wider">Delivery CDN</span>
+                  </div>
+                  <span className="text-slate-800 font-sans font-semibold text-xs truncate" title={r2PublicUrl || r2Status?.publicUrl || 'Cloudflare CDN'}>
+                    {r2PublicUrl || r2Status?.publicUrl ? 'Cloudflare CDN' : 'Zero Egress'}
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            <div className="pt-3 border-t border-slate-100 flex items-center justify-between gap-2">
+              <button
+                type="button"
+                onClick={handleCopyR2Snippet}
+                className="px-3 py-2 rounded-xl text-xs font-semibold bg-amber-50 hover:bg-amber-100 text-amber-900 border border-amber-300 transition flex items-center gap-1.5 flex-1 justify-center shadow-2xs"
+              >
+                {copiedR2Snippet ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5 text-amber-700" />}
+                <span>{copiedR2Snippet ? 'Copied R2 Config' : 'Copy R2 Config'}</span>
+              </button>
+              <a
+                href="https://dash.cloudflare.com/?to=/:account/r2"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="px-3 py-2 rounded-xl text-xs font-semibold text-amber-800 hover:bg-amber-100 border border-amber-200 transition flex items-center gap-1.5 shrink-0"
+                title="Open Cloudflare R2 Dashboard"
+              >
+                <span>Console</span>
+                <ExternalLink className="w-3.5 h-3.5" />
+              </a>
             </div>
           </div>
         </div>
@@ -1437,7 +1773,7 @@ export const INITIAL_CLOUD_SETTINGS: CloudAccountSettings = ${JSON.stringify(clo
   return (
     <div className="fixed inset-0 z-60 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-3 sm:p-5 overflow-y-auto animate-in fade-in">
       <div 
-        className="bg-[#f0f4f8] w-full max-w-4xl rounded-3xl border border-[#c8d7e3] shadow-2xl flex flex-col max-h-[92vh] overflow-hidden animate-in zoom-in-95 duration-200"
+        className="bg-[#f0f4f8] w-full max-w-5xl xl:max-w-6xl rounded-3xl border border-[#c8d7e3] shadow-2xl flex flex-col max-h-[92vh] overflow-hidden animate-in zoom-in-95 duration-200"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
@@ -1479,7 +1815,7 @@ export const INITIAL_CLOUD_SETTINGS: CloudAccountSettings = ${JSON.stringify(clo
         </div>
 
         {/* Tab Switcher */}
-        <div className="px-4 sm:px-6 pt-3 pb-0 bg-[#f8fafc] border-b border-[#c8d7e3] flex items-center space-x-2 shrink-0">
+        <div className="px-4 sm:px-6 pt-3 pb-0 bg-[#f8fafc] border-b border-[#c8d7e3] flex items-center space-x-2 shrink-0 overflow-x-auto">
           <button
             type="button"
             onClick={() => setActiveTab('firebase')}
@@ -1548,6 +1884,28 @@ export const INITIAL_CLOUD_SETTINGS: CloudAccountSettings = ${JSON.stringify(clo
 
           <button
             type="button"
+            onClick={() => setActiveTab('r2')}
+            className={`px-4 py-2.5 rounded-t-xl text-xs sm:text-sm font-serif font-bold transition flex items-center space-x-2 border-t border-x ${
+              activeTab === 'r2'
+                ? 'bg-[#ffffff] text-[#3A5A74] border-[#c8d7e3] -mb-px shadow-xs'
+                : 'text-[#506173] hover:text-[#18232c] border-transparent hover:bg-[#ebf2f7]'
+            }`}
+          >
+            <Video className="w-4 h-4 text-amber-600" />
+            <span>Cloudflare R2</span>
+            {r2Status?.configured ? (
+              <span className="ml-1.5 px-2 py-0.5 rounded-full text-[10px] font-sans bg-emerald-100 text-emerald-800 font-semibold">
+                Active S3
+              </span>
+            ) : (
+              <span className="ml-1.5 px-2 py-0.5 rounded-full text-[10px] font-sans bg-slate-200 text-slate-700 font-semibold">
+                Setup
+              </span>
+            )}
+          </button>
+
+          <button
+            type="button"
             onClick={() => setActiveTab('backup')}
             className={`px-4 py-2.5 rounded-t-xl text-xs sm:text-sm font-serif font-bold transition flex items-center space-x-2 border-t border-x ${
               activeTab === 'backup'
@@ -1558,7 +1916,7 @@ export const INITIAL_CLOUD_SETTINGS: CloudAccountSettings = ${JSON.stringify(clo
             <Layers className="w-4 h-4 text-emerald-600" />
             <span>Presets & Backup Suite</span>
             <span className="ml-1.5 px-2 py-0.5 rounded-full text-[10px] font-sans bg-emerald-100 text-emerald-800 font-semibold">
-              3 Clouds
+              4 Clouds
             </span>
           </button>
         </div>
@@ -3644,6 +4002,461 @@ export const INITIAL_CLOUD_SETTINGS: CloudAccountSettings = ${JSON.stringify(clo
                     className="inline-flex items-center gap-1 text-[#3A5A74] hover:underline font-semibold"
                   >
                     <span>Open ImageKit Developer Dashboard</span>
+                    <ExternalLink className="w-3.5 h-3.5" />
+                  </a>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* TAB 4: CLOUDFLARE R2 & VIDEO STORAGE */}
+          {activeTab === 'r2' && (
+            <div className="space-y-6 animate-in fade-in">
+              {/* Header Banner */}
+              <div className="p-4 sm:p-5 bg-[#ffffff] rounded-2xl border border-[#c8d7e3] flex flex-wrap items-center justify-between gap-3 shadow-xs">
+                <div>
+                  <h4 className="font-serif font-bold text-[#18232c] text-base sm:text-lg flex items-center space-x-2">
+                    <Video className="w-5 h-5 text-amber-600" />
+                    <span>Cloudflare R2 Cloud Storage & Account Settings</span>
+                  </h4>
+                  <p className="text-[#475569] text-xs sm:text-sm font-serif italic mt-0.5">
+                    Configure, test, or replace your Cloudflare R2 API credentials for high-resolution keepsake video blessings with zero egress fees.
+                  </p>
+                </div>
+
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={checkCloudflareR2Status}
+                    disabled={isCheckingR2}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-[#ebf2f7] hover:bg-[#dbe7f0] text-[#3A5A74] border border-[#c8d7e3] rounded-xl text-xs font-semibold transition disabled:opacity-50"
+                    title="Refresh R2 connection status from server"
+                  >
+                    <RefreshCw className={`w-3.5 h-3.5 ${isCheckingR2 ? 'animate-spin' : ''}`} />
+                    <span>{isCheckingR2 ? 'Checking...' : 'Refresh Status'}</span>
+                  </button>
+                </div>
+              </div>
+
+              {/* Status Card */}
+              <div className="p-5 sm:p-6 bg-[#ffffff] rounded-2xl border border-[#c8d7e3] shadow-xs space-y-4">
+                <div className="flex items-center justify-between border-b border-[#c8d7e3] pb-3 flex-wrap gap-2">
+                  <div>
+                    <h5 className="font-serif font-bold text-[#18232c] text-sm sm:text-base uppercase tracking-wider flex items-center gap-2">
+                      <ShieldCheck className="w-4 h-4 text-amber-600" />
+                      <span>Cloudflare R2 Active Connection Status</span>
+                    </h5>
+                    <p className="text-xs text-[#475569] mt-0.5 font-serif italic">
+                      Current server-side S3-compatible storage configuration and verification state.
+                    </p>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-3.5">
+                  <div className="p-4 rounded-xl border bg-[#f8fafc] border-[#c8d7e3] space-y-1">
+                    <span className="text-xs uppercase tracking-wider font-bold text-[#506173]">Account Status</span>
+                    <div className="pt-1">
+                      {r2Status?.configured ? (
+                        <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-bold bg-emerald-100 text-emerald-800 border border-emerald-300">
+                          <span className="w-2 h-2 rounded-full bg-emerald-600 animate-pulse"></span>
+                          <span>Connected & Active</span>
+                        </span>
+                      ) : (
+                        <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-bold bg-amber-100 text-amber-900 border border-amber-300">
+                          <AlertCircle className="w-3.5 h-3.5 text-amber-700" />
+                          <span>Not Configured</span>
+                        </span>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="p-4 rounded-xl border bg-[#f8fafc] border-[#c8d7e3] space-y-1">
+                    <span className="text-xs uppercase tracking-wider font-bold text-[#506173]">Credential Source</span>
+                    <div className="text-sm font-semibold text-[#18232c] pt-1">
+                      {r2Status?.source === 'cloud' ? (
+                        <span className="inline-flex items-center gap-1 text-emerald-800 font-semibold">
+                          <Database className="w-3.5 h-3.5" />
+                          <span>Cloud Firestore (Saved Permanently)</span>
+                        </span>
+                      ) : r2Status?.source === 'custom' ? (
+                        <span className="inline-flex items-center gap-1 text-amber-800 font-semibold">
+                          <KeyRound className="w-3.5 h-3.5" />
+                          <span>Server & Cloud Storage</span>
+                        </span>
+                      ) : r2Status?.source === 'local' ? (
+                        <span className="inline-flex items-center gap-1 text-indigo-800 font-semibold">
+                          <Globe className="w-3.5 h-3.5" />
+                          <span>Browser Storage (Static / Local)</span>
+                        </span>
+                      ) : r2Status?.source === 'env' ? (
+                        <span className="inline-flex items-center gap-1 text-slate-700 font-medium">
+                          <Code className="w-3.5 h-3.5" />
+                          <span>Server Environment (.env)</span>
+                        </span>
+                      ) : (
+                        <span className="text-slate-500 italic">None configured</span>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="p-4 rounded-xl border bg-[#f8fafc] border-[#c8d7e3] space-y-1">
+                    <span className="text-xs uppercase tracking-wider font-bold text-[#506173]">Secret Key State</span>
+                    <div className="pt-1 font-mono text-xs text-[#18232c] truncate">
+                      {r2Status?.hasSecretAccessKey ? (
+                        <span className="text-emerald-700 font-semibold flex items-center gap-1">
+                          <Lock className="w-3 h-3 text-emerald-600" />
+                          <span>{r2Status.maskedSecretAccessKey || 'Key stored securely'}</span>
+                        </span>
+                      ) : (
+                        <span className="text-slate-400 italic">No key active</span>
+                      )}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
+                  <div className="p-3 bg-amber-50/70 border border-amber-200 rounded-xl text-xs text-amber-900 flex items-center gap-2">
+                    <Layers className="w-4 h-4 text-amber-600 shrink-0" />
+                    <span><strong>Target Bucket:</strong> <code className="font-mono">{r2BucketName || r2Status?.bucketName || 'wedding-videos'}</code></span>
+                  </div>
+
+                  <div className="p-3 bg-sky-50/70 border border-sky-200 rounded-xl text-xs text-sky-900 flex items-center gap-2">
+                    <Globe className="w-4 h-4 text-sky-600 shrink-0" />
+                    <span className="truncate"><strong>Public CDN Domain:</strong> <code className="font-mono">{r2PublicUrl || r2Status?.publicUrl || 'https://pub-9426f4fce849e75ba9560f855a882cb0.r2.dev'}</code></span>
+                  </div>
+                </div>
+              </div>
+
+              {/* Notifications */}
+              {r2SaveResult && (
+                <div className={`p-4 rounded-2xl text-xs sm:text-sm font-semibold flex items-center gap-2.5 animate-in fade-in ${
+                  r2SaveResult.success 
+                    ? 'bg-emerald-50 text-emerald-900 border border-emerald-300' 
+                    : 'bg-rose-50 text-rose-900 border border-rose-300'
+                }`}>
+                  {r2SaveResult.success ? <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0" /> : <AlertCircle className="w-5 h-5 text-rose-600 shrink-0" />}
+                  <span>{r2SaveResult.message}</span>
+                </div>
+              )}
+
+              {r2TestResult && (
+                <div className={`p-4 rounded-2xl text-xs sm:text-sm font-semibold flex items-center gap-2.5 animate-in fade-in ${
+                  r2TestResult.success 
+                    ? 'bg-emerald-50 text-emerald-900 border border-emerald-300' 
+                    : 'bg-rose-50 text-rose-900 border border-rose-300'
+                }`}>
+                  {r2TestResult.success ? <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0" /> : <AlertCircle className="w-5 h-5 text-rose-600 shrink-0" />}
+                  <span>{r2TestResult.message}</span>
+                </div>
+              )}
+
+              {/* Credential Form */}
+              <form onSubmit={handleSaveR2} className="p-5 sm:p-6 bg-[#ffffff] rounded-2xl border border-[#c8d7e3] shadow-xs space-y-5">
+                <div className="border-b border-[#c8d7e3] pb-3 flex items-center justify-between flex-wrap gap-2">
+                  <div>
+                    <h5 className="font-serif font-bold text-[#18232c] text-sm sm:text-base uppercase tracking-wider flex items-center gap-2">
+                      <KeyRound className="w-4 h-4 text-amber-600" />
+                      <span>Update Cloudflare R2 Credentials</span>
+                    </h5>
+                    <p className="text-xs text-[#475569] mt-0.5 font-serif italic">
+                      Enter your Cloudflare R2 S3-compatible API credentials below. Changes take effect immediately for all video uploads and streaming.
+                    </p>
+                  </div>
+
+                  {(r2Status?.hasSecretAccessKey || r2AccountId || r2AccessKeyId || r2SecretAccessKey || r2BucketName || r2Status?.configured) && (
+                    <button
+                      type="button"
+                      onClick={handleResetR2}
+                      disabled={r2IsResetting || r2IsSaving}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold text-rose-700 bg-rose-50 hover:bg-rose-100 border border-rose-200 transition disabled:opacity-50"
+                      title="Permanently remove all R2 keys from Cloud Firestore, Server, and Local Storage"
+                    >
+                      <Trash2 className={`w-3.5 h-3.5 ${r2IsResetting ? 'animate-spin' : ''}`} />
+                      <span>{r2IsResetting ? 'Deleting...' : 'Delete / Clear Credentials'}</span>
+                    </button>
+                  )}
+                </div>
+
+                <div className="space-y-4">
+                  {/* 1. Account ID */}
+                  <div>
+                    <div className="flex items-center justify-between mb-1">
+                      <label className="block text-xs uppercase tracking-wider font-bold text-[#506173]">
+                        R2_ACCOUNT_ID
+                      </label>
+                      <span className="text-[11px] text-[#475569] font-sans">Cloudflare 32-character Hex Account ID</span>
+                    </div>
+                    <div className="relative">
+                      <input
+                        type="text"
+                        value={r2AccountId}
+                        onChange={(e) => setR2AccountId(e.target.value)}
+                        placeholder="e.g. 9426f4fce849e75ba9560f855a882cb0"
+                        className="w-full pl-3.5 pr-9 py-2.5 rounded-xl bg-[#ffffff] border border-[#c8d7e3] text-sm text-[#18232c] font-mono focus:ring-2 focus:ring-amber-500 focus:outline-hidden"
+                      />
+                      {r2AccountId && (
+                        <button
+                          type="button"
+                          onClick={() => setR2AccountId('')}
+                          className="absolute right-3 top-1/2 -translate-y-1/2 p-0.5 text-slate-400 hover:text-slate-600 rounded-full"
+                          title="Clear Account ID"
+                        >
+                          <X className="w-4 h-4" />
+                        </button>
+                      )}
+                    </div>
+                    <p className="text-[11px] text-[#506173] font-serif italic mt-1">
+                      Located in Cloudflare Dashboard URL or right sidebar under &ldquo;Account ID&rdquo;.
+                    </p>
+                  </div>
+
+                  {/* 2. Access Key ID */}
+                  <div>
+                    <div className="flex items-center justify-between mb-1">
+                      <label className="block text-xs uppercase tracking-wider font-bold text-[#506173]">
+                        R2_ACCESS_KEY_ID
+                      </label>
+                      <span className="text-[11px] text-[#475569] font-sans">S3-Compatible Access Key</span>
+                    </div>
+                    <div className="relative">
+                      <input
+                        type="text"
+                        value={r2AccessKeyId}
+                        onChange={(e) => setR2AccessKeyId(e.target.value)}
+                        placeholder="e.g. 65e6cb7bc4db4e0b5f13426e680a6d09"
+                        className="w-full pl-3.5 pr-9 py-2.5 rounded-xl bg-[#ffffff] border border-[#c8d7e3] text-sm text-[#18232c] font-mono focus:ring-2 focus:ring-amber-500 focus:outline-hidden"
+                      />
+                      {r2AccessKeyId && (
+                        <button
+                          type="button"
+                          onClick={() => setR2AccessKeyId('')}
+                          className="absolute right-3 top-1/2 -translate-y-1/2 p-0.5 text-slate-400 hover:text-slate-600 rounded-full"
+                          title="Clear Access Key ID"
+                        >
+                          <X className="w-4 h-4" />
+                        </button>
+                      )}
+                    </div>
+                    <p className="text-[11px] text-[#506173] font-serif italic mt-1">
+                      Generated from Cloudflare R2 &rarr; Manage R2 API Tokens.
+                    </p>
+                  </div>
+
+                  {/* 3. Secret Access Key */}
+                  <div>
+                    <div className="flex items-center justify-between mb-1">
+                      <label className="block text-xs uppercase tracking-wider font-bold text-[#506173]">
+                        R2_SECRET_ACCESS_KEY
+                      </label>
+                      <div className="flex items-center gap-2">
+                        {r2Status?.hasSecretAccessKey && (
+                          <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded-md border border-emerald-200">
+                            <Check className="w-3 h-3 text-emerald-600" />
+                            <span>Saved in Cloud & Server</span>
+                          </span>
+                        )}
+                        <span className="text-[11px] text-amber-800 font-sans font-medium">Confidential</span>
+                      </div>
+                    </div>
+                    <div className="relative">
+                      <input
+                        type={r2ShowSecretKey ? 'text' : 'password'}
+                        value={r2SecretAccessKey}
+                        onChange={(e) => setR2SecretAccessKey(e.target.value)}
+                        placeholder={
+                          r2Status?.maskedSecretAccessKey
+                            ? `Enter new secret key (Current: ${r2Status.maskedSecretAccessKey})`
+                            : 'Enter R2 Secret Access Key'
+                        }
+                        className="w-full pl-3.5 pr-16 py-2.5 rounded-xl bg-[#ffffff] border border-[#c8d7e3] text-sm text-[#18232c] font-mono focus:ring-2 focus:ring-amber-500 focus:outline-hidden"
+                      />
+                      <div className="absolute right-3 top-1/2 -translate-y-1/2 flex items-center space-x-1.5 text-[#475569]">
+                        {r2SecretAccessKey && (
+                          <button
+                            type="button"
+                            onClick={() => setR2SecretAccessKey('')}
+                            className="p-1 text-slate-400 hover:text-slate-600 transition"
+                            title="Clear Secret Key"
+                          >
+                            <X className="w-4 h-4" />
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => setR2ShowSecretKey(!r2ShowSecretKey)}
+                          className="p-1 hover:text-[#18232c] transition"
+                          title={r2ShowSecretKey ? 'Hide Secret Key' : 'Show Secret Key'}
+                        >
+                          {r2ShowSecretKey ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                        </button>
+                      </div>
+                    </div>
+                    <p className="text-[11px] text-[#506173] font-serif italic mt-1">
+                      Saved permanently in Cloud Firestore & Server. Never exposed to unauthorized clients.
+                    </p>
+                  </div>
+
+                  {/* 4. Bucket Name */}
+                  <div>
+                    <div className="flex items-center justify-between mb-1">
+                      <label className="block text-xs uppercase tracking-wider font-bold text-[#506173]">
+                        R2_BUCKET_NAME
+                      </label>
+                      <span className="text-[11px] text-[#475569] font-sans">Storage Container</span>
+                    </div>
+                    <div className="relative">
+                      <input
+                        type="text"
+                        value={r2BucketName}
+                        onChange={(e) => setR2BucketName(e.target.value)}
+                        placeholder="e.g. wedding-videos"
+                        className="w-full pl-3.5 pr-9 py-2.5 rounded-xl bg-[#ffffff] border border-[#c8d7e3] text-sm text-[#18232c] font-mono focus:ring-2 focus:ring-amber-500 focus:outline-hidden"
+                      />
+                      {r2BucketName && (
+                        <button
+                          type="button"
+                          onClick={() => setR2BucketName('')}
+                          className="absolute right-3 top-1/2 -translate-y-1/2 p-0.5 text-slate-400 hover:text-slate-600 rounded-full"
+                          title="Clear Bucket Name"
+                        >
+                          <X className="w-4 h-4" />
+                        </button>
+                      )}
+                    </div>
+                    <p className="text-[11px] text-[#506173] font-serif italic mt-1">
+                      The name of your R2 bucket created in Cloudflare (e.g. wedding-videos).
+                    </p>
+                  </div>
+
+                  {/* 5. Public URL Domain */}
+                  <div>
+                    <div className="flex items-center justify-between mb-1">
+                      <label className="block text-xs uppercase tracking-wider font-bold text-[#506173]">
+                        R2_PUBLIC_URL
+                      </label>
+                      <span className="text-[11px] text-[#475569] font-sans">Public Streaming URL / r2.dev</span>
+                    </div>
+                    <div className="relative">
+                      <input
+                        type="url"
+                        value={r2PublicUrl}
+                        onChange={(e) => setR2PublicUrl(e.target.value)}
+                        placeholder="e.g. https://pub-xxxxxxxxxxxx.r2.dev or https://videos.yourwedding.com"
+                        className="w-full pl-3.5 pr-9 py-2.5 rounded-xl bg-[#ffffff] border border-[#c8d7e3] text-sm text-[#18232c] font-mono focus:ring-2 focus:ring-amber-500 focus:outline-hidden"
+                      />
+                      {r2PublicUrl && (
+                        <button
+                          type="button"
+                          onClick={() => setR2PublicUrl('')}
+                          className="absolute right-3 top-1/2 -translate-y-1/2 p-0.5 text-slate-400 hover:text-slate-600 rounded-full"
+                          title="Clear Public URL"
+                        >
+                          <X className="w-4 h-4" />
+                        </button>
+                      )}
+                    </div>
+                    <p className="text-[11px] text-[#506173] font-serif italic mt-1">
+                      Enable &ldquo;Public access&rdquo; on your bucket (or connect custom domain) to get this URL for video streaming.
+                    </p>
+                  </div>
+                </div>
+
+                {/* Actions */}
+                <div className="pt-3 border-t border-[#c8d7e3] flex items-center justify-between flex-wrap gap-3">
+                  <button
+                    type="button"
+                    onClick={handleTestR2}
+                    disabled={r2IsTesting || (!r2SecretAccessKey.trim() && !r2Status?.hasSecretAccessKey)}
+                    className="px-4 py-2.5 rounded-xl text-xs sm:text-sm font-semibold bg-[#ebf2f7] hover:bg-[#dbe7f0] text-[#3A5A74] border border-[#c8d7e3] transition flex items-center space-x-2 disabled:opacity-50 disabled:cursor-not-allowed shadow-xs"
+                  >
+                    {r2IsTesting ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
+                    <span>{r2IsTesting ? 'Pinging Cloudflare R2...' : 'Test Connection'}</span>
+                  </button>
+
+                  <div className="flex items-center space-x-3 flex-wrap gap-2">
+                    {(r2Status?.hasSecretAccessKey || r2AccountId || r2AccessKeyId || r2SecretAccessKey || r2BucketName || r2Status?.configured) && (
+                      <button
+                        type="button"
+                        onClick={handleResetR2}
+                        disabled={r2IsSaving || r2IsResetting}
+                        className="px-4 py-2.5 rounded-xl text-xs sm:text-sm font-semibold bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-300 transition flex items-center space-x-1.5 shadow-xs disabled:opacity-50"
+                        title="Permanently remove all R2 keys from Cloud Firestore, Server, and Local Storage"
+                      >
+                        <Trash2 className="w-4 h-4 text-rose-600" />
+                        <span>{r2IsResetting ? 'Deleting...' : 'Delete / Clear Credentials'}</span>
+                      </button>
+                    )}
+
+                    <button
+                      type="submit"
+                      disabled={r2IsSaving || r2IsResetting}
+                      className="px-6 py-2.5 bg-amber-700 hover:bg-amber-800 text-white text-xs sm:text-sm font-semibold rounded-xl transition shadow-md border border-amber-800 flex items-center space-x-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      {r2IsSaving ? (
+                        <Loader2 className="w-4 h-4 animate-spin text-amber-200" />
+                      ) : (
+                        <ShieldCheck className="w-4 h-4 text-amber-200" />
+                      )}
+                      <span>
+                        {r2IsSaving
+                          ? 'Saving & Applying...'
+                          : (!r2AccountId.trim() && !r2AccessKeyId.trim() && !r2SecretAccessKey.trim() && r2Status?.hasSecretAccessKey)
+                            ? 'Save & Apply (Delete Credentials)'
+                            : 'Save & Apply'}
+                      </span>
+                    </button>
+                  </div>
+                </div>
+              </form>
+
+              {/* Helpful Setup Guide */}
+              <div className="p-5 sm:p-6 bg-[#ffffff] rounded-2xl border border-[#c8d7e3] shadow-xs space-y-4">
+                <h5 className="font-serif font-bold text-[#18232c] text-sm sm:text-base uppercase tracking-wider flex items-center gap-2">
+                  <Info className="w-4 h-4 text-amber-600" />
+                  <span>How to set up Cloudflare R2 for guest video blessings</span>
+                </h5>
+
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs text-[#334155]">
+                  <div className="p-4 rounded-xl bg-[#ebf2f7]/60 border border-[#c8d7e3] space-y-1.5">
+                    <div className="font-bold text-[#18232c] flex items-center gap-1.5">
+                      <span className="w-5 h-5 rounded-full bg-amber-600 text-white flex items-center justify-center text-[11px]">1</span>
+                      <span>Create R2 Bucket</span>
+                    </div>
+                    <p className="font-serif leading-relaxed text-[#475569]">
+                      Log into <strong>dash.cloudflare.com</strong> &rarr; <strong>R2 Object Storage</strong> &rarr; Click <strong>Create Bucket</strong> (e.g. <code>wedding-videos</code>).
+                    </p>
+                  </div>
+
+                  <div className="p-4 rounded-xl bg-[#ebf2f7]/60 border border-[#c8d7e3] space-y-1.5">
+                    <div className="font-bold text-[#18232c] flex items-center gap-1.5">
+                      <span className="w-5 h-5 rounded-full bg-amber-600 text-white flex items-center justify-center text-[11px]">2</span>
+                      <span>Generate API Tokens</span>
+                    </div>
+                    <p className="font-serif leading-relaxed text-[#475569]">
+                      Click <strong>Manage R2 API Tokens</strong> &rarr; <strong>Create API Token</strong> with <em>Object Read &amp; Write</em> permission. Copy the <strong>Access Key ID</strong> &amp; <strong>Secret Access Key</strong>.
+                    </p>
+                  </div>
+
+                  <div className="p-4 rounded-xl bg-[#ebf2f7]/60 border border-[#c8d7e3] space-y-1.5">
+                    <div className="font-bold text-[#18232c] flex items-center gap-1.5">
+                      <span className="w-5 h-5 rounded-full bg-amber-600 text-white flex items-center justify-center text-[11px]">3</span>
+                      <span>Enable Public Access</span>
+                    </div>
+                    <p className="font-serif leading-relaxed text-[#475569]">
+                      Under bucket <strong>Settings &rarr; Public Access</strong>, enable the <code>r2.dev</code> subdomain or connect your custom domain to allow video playback.
+                    </p>
+                  </div>
+                </div>
+
+                <div className="pt-2 flex items-center justify-between text-xs text-[#506173]">
+                  <span>Need to manage or view stored videos directly on Cloudflare?</span>
+                  <a
+                    href="https://dash.cloudflare.com/?to=/:account/r2"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center gap-1 text-amber-800 hover:underline font-semibold"
+                  >
+                    <span>Open Cloudflare R2 Dashboard</span>
                     <ExternalLink className="w-3.5 h-3.5" />
                   </a>
                 </div>

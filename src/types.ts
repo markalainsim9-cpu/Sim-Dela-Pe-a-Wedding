@@ -201,12 +201,24 @@ export interface ImageKitAccountSettings {
   cdnOptimization: string;
 }
 
+export interface R2AccountSettings {
+  accountId: string;
+  accessKeyId: string;
+  secretAccessKey?: string;
+  bucketName: string;
+  publicUrl?: string;
+  configured: boolean;
+  uploadFolder: string;
+  deliveryType: string;
+}
+
 export interface CloudAccountSettings {
   version?: string;
   exportedAt?: string;
   firebase: FirebaseAccountDetails;
   supabase: SupabaseAccountSettings;
   imagekit: ImageKitAccountSettings;
+  r2?: R2AccountSettings;
 }
 
 /**

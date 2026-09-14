@@ -7,3 +7,4 @@ coverage/
 .env*
 !.env.example
 imagekit-config.json
+r2-config.json

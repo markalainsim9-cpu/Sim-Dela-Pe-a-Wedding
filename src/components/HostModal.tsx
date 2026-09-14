@@ -243,7 +243,7 @@ export const HostModal: React.FC<HostModalProps> = ({
 
   const [view, setView] = useState<'list' | 'seating' | 'invitation' | 'slideshow' | 'qr-display' | 'guestbook'>('list');
   const [isCloudSettingsOpen, setIsCloudSettingsOpen] = useState(false);
-  const [cloudSettingsInitialTab, setCloudSettingsInitialTab] = useState<'firebase' | 'supabase' | 'imagekit' | 'backup'>('firebase');
+  const [cloudSettingsInitialTab, setCloudSettingsInitialTab] = useState<'firebase' | 'supabase' | 'imagekit' | 'r2' | 'backup'>('firebase');
 
   // Guestbook Management State
   const [guestbookSearch, setGuestbookSearch] = useState('');
